@@ -71,16 +71,17 @@ On macOS, `qs` can be bound to a global hotkey with the Shortcuts app. Add a "Ru
 
 ## Platform support
 
-| Capability                 | macOS | Linux | Windows |
-|----------------------------|:-----:|:-----:|:-------:|
-| Firefox tabs               | Yes   | Yes   | Yes     |
-| Chrome and Safari tabs     | Yes   | No    | No      |
-| Terminal directories       | Yes   | Yes   | Yes     |
-| VS Code workspaces         | Yes   | Yes   | Yes     |
-| Claude Code / Codex resume | Yes   | Yes   | Yes     |
-| Web panel                  | Yes   | Yes   | Yes     |
+| Capability                  | macOS | Linux | Windows |
+|-----------------------------|:-----:|:-----:|:-------:|
+| Chrome, Edge, Brave tabs    | Yes   | Yes   | Yes     |
+| Firefox tabs                | Yes   | Yes   | Yes     |
+| Safari tabs                 | Yes   | No    | No      |
+| Terminal directories        | Yes   | Yes   | Yes     |
+| VS Code workspaces          | Yes   | Yes   | Yes     |
+| Claude Code / Codex resume  | Yes   | Yes   | Yes     |
+| Web panel                   | Yes   | Yes   | Yes     |
 
-Firefox tabs are read from its session file on every platform. Chrome and Safari tab capture rely on AppleScript and stay macOS only. Terminal directories on Windows come from the Win32 process API, and AI sessions resume in a terminal window. On macOS an AI session that lived in the VS Code integrated terminal resumes there. The Windows backends read process state through PowerShell and the Win32 API and are ready for validation on a real Windows machine.
+On macOS, Chrome and Safari are read live through AppleScript. On Windows and Linux, Chromium family browsers are read through the DevTools endpoint when the browser exposes one and through their on disk session files otherwise. The session file path is a best effort over an undocumented format, validated against live AppleScript output on macOS where both engines see the same data. Firefox is read from its session file on every platform. Only browsers with a running process are captured, and only profiles active within the last hour are included. On macOS an AI session that lived in the VS Code integrated terminal resumes there. The Windows backends read process state through PowerShell and the Win32 API and are ready for validation on a real Windows machine.
 
 ## Permissions on macOS
 

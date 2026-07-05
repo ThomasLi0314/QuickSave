@@ -11,12 +11,13 @@ or ~/.quicksave (Linux/Windows). Nothing is uploaded.
 
 Platform support:
   macOS   full (Chrome/Safari/Firefox tabs, terminals, VS Code, AI sessions)
-  Linux   terminals, VS Code, AI sessions, Firefox tabs
-  Windows terminals, VS Code, AI sessions, Firefox tabs
-Chrome and Safari tab capture use AppleScript and are macOS only. On every
-platform Firefox tabs are read from its session file. Windows backends read
-process state through PowerShell and the Win32 API and want testing on a real
-Windows machine.
+  Linux   Chrome/Edge/Brave/Firefox tabs, terminals, VS Code, AI sessions
+  Windows Chrome/Edge/Brave/Firefox tabs, terminals, VS Code, AI sessions
+On macOS, Chrome and Safari are read live through AppleScript. Elsewhere,
+Chromium browsers are read through the DevTools endpoint when one is exposed
+and through their session files otherwise. Firefox is read from its session
+file on every platform. Windows backends read process state through
+PowerShell and the Win32 API and want testing on a real Windows machine.
 """
 import json, os, re, subprocess, sys, datetime, time, shutil, webbrowser
 from urllib.parse import unquote
@@ -331,6 +332,171 @@ end tell'''
 
 _AGENT_RE = re.compile(r'(?i)(?:^|[\\/"\s])(claude|codex)(?:\.exe|\.cmd|\.js|\.ps1)?(?:["\s]|$)')
 
+def _chromium_roots():
+    """(name, user-data root) for every Chromium-family browser on this OS."""
+    if IS_MAC:
+        base = os.path.expanduser('~/Library/Application Support')
+        cands = [('Chrome', os.path.join(base, 'Google/Chrome')),
+                 ('Edge', os.path.join(base, 'Microsoft Edge')),
+                 ('Brave', os.path.join(base, 'BraveSoftware/Brave-Browser')),
+                 ('Chromium', os.path.join(base, 'Chromium'))]
+    elif IS_WIN:
+        base = os.environ.get('LOCALAPPDATA', '')
+        cands = [('Chrome', os.path.join(base, 'Google', 'Chrome', 'User Data')),
+                 ('Edge', os.path.join(base, 'Microsoft', 'Edge', 'User Data')),
+                 ('Brave', os.path.join(base, 'BraveSoftware', 'Brave-Browser', 'User Data')),
+                 ('Chromium', os.path.join(base, 'Chromium', 'User Data'))]
+    else:
+        base = os.path.expanduser('~/.config')
+        cands = [('Chrome', os.path.join(base, 'google-chrome')),
+                 ('Edge', os.path.join(base, 'microsoft-edge')),
+                 ('Brave', os.path.join(base, 'BraveSoftware', 'Brave-Browser')),
+                 ('Chromium', os.path.join(base, 'chromium'))]
+    return [(n, p) for n, p in cands if os.path.isdir(p)]
+
+def _parse_snss(path):
+    """Parse a Chromium SNSS session file into windows of live tabs.
+    Best effort over an undocumented format. Returns [[{url,title}], ...]."""
+    import struct
+    try:
+        data = open(path, 'rb').read()
+    except Exception:
+        return []
+    if data[:4] != b'SNSS':
+        return []
+    pos = 8                                   # magic + int32 version
+    tabs, wtype = {}, {}
+    dead_tabs, dead_wins = set(), set()
+    while pos + 3 <= len(data):
+        (size,) = struct.unpack_from('<H', data, pos); pos += 2
+        if size == 0 or pos + size > len(data):
+            break
+        cmd = data[pos]
+        payload = data[pos + 1:pos + size]
+        pos += size
+        try:
+            if cmd == 0 and len(payload) >= 8:            # SetTabWindow
+                w, t = struct.unpack_from('<ii', payload, 0)
+                tabs.setdefault(t, {})['win'] = w
+            elif cmd == 2 and len(payload) >= 8:          # SetTabIndexInWindow
+                t, idx = struct.unpack_from('<ii', payload, 0)
+                tabs.setdefault(t, {})['index'] = idx
+            elif cmd == 6 and len(payload) >= 16:         # UpdateTabNavigation
+                p = payload[4:]                            # skip pickle header
+                (tab_id, nav_idx, ulen) = struct.unpack_from('<iiI', p, 0)
+                off = 12
+                if ulen > 100000 or off + ulen > len(p):
+                    continue
+                url = p[off:off + ulen].decode('utf-8', 'ignore')
+                off += (ulen + 3) & ~3
+                title = ''
+                if off + 4 <= len(p):
+                    (tlen,) = struct.unpack_from('<I', p, off); off += 4
+                    if tlen < 50000 and off + tlen * 2 <= len(p):
+                        title = p[off:off + tlen * 2].decode('utf-16-le', 'ignore')
+                tabs.setdefault(tab_id, {}).setdefault('navs', {})[nav_idx] = (url, title)
+            elif cmd == 7 and len(payload) >= 8:          # SetSelectedNavigationIndex
+                t, idx = struct.unpack_from('<ii', payload, 0)
+                tabs.setdefault(t, {})['sel'] = idx
+            elif cmd == 9 and len(payload) >= 8:          # SetWindowType
+                w, ty = struct.unpack_from('<ii', payload, 0)
+                wtype[w] = ty
+            elif cmd == 16 and len(payload) >= 4:         # TabClosed
+                dead_tabs.add(struct.unpack_from('<i', payload, 0)[0])
+            elif cmd == 17 and len(payload) >= 4:         # WindowClosed
+                dead_wins.add(struct.unpack_from('<i', payload, 0)[0])
+        except Exception:
+            continue
+    wins = {}
+    for t, info in tabs.items():
+        if t in dead_tabs:
+            continue
+        w = info.get('win')
+        if w is None or w in dead_wins:
+            continue
+        if wtype.get(w, 0) != 0:                          # keep normal windows only
+            continue
+        navs = info.get('navs') or {}
+        if not navs:
+            continue
+        sel = info.get('sel')
+        if sel is None or sel not in navs:
+            sel = max(navs)
+        url, title = navs[sel]
+        if not url.startswith(('http', 'file')):
+            continue
+        wins.setdefault(w, []).append((info.get('index', 0), {'url': url, 'title': title}))
+    out = []
+    for w in sorted(wins):
+        row = [x[1] for x in sorted(wins[w], key=lambda x: x[0])]
+        if row:
+            out.append(row)
+    return out
+
+def _snss_windows(root):
+    """Windows of tabs from the newest Session_ file of each active profile.
+    A profile counts as active when its session file was written within the
+    last hour. The most recent file overall is always included."""
+    import glob
+    pats = [os.path.join(root, '*', 'Sessions', 'Session_*'),
+            os.path.join(root, 'Sessions', 'Session_*')]
+    per_profile = {}
+    for pat in pats:
+        for f in glob.glob(pat):
+            prof = os.path.dirname(os.path.dirname(f))
+            cur = per_profile.get(prof)
+            if cur is None or os.path.getmtime(f) > os.path.getmtime(cur):
+                per_profile[prof] = f
+    if not per_profile:
+        return []
+    now = time.time()
+    newest = max(per_profile.values(), key=os.path.getmtime)
+    out = []
+    for f in per_profile.values():
+        if f == newest or now - os.path.getmtime(f) < 3600:
+            out += _parse_snss(f)
+    return out
+
+def _devtools_windows(root):
+    """Tabs via the DevTools endpoint when the browser exposes one."""
+    import urllib.request
+    port_file = os.path.join(root, 'DevToolsActivePort')
+    try:
+        port = int(open(port_file).readline().strip())
+    except Exception:
+        return []
+    try:
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/json/list', timeout=2) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return []
+    tabs = [{'url': d.get('url', ''), 'title': d.get('title', '')}
+            for d in data
+            if d.get('type') == 'page' and d.get('url', '').startswith(('http', 'file'))]
+    return [tabs] if tabs else []
+
+_BROWSER_TOKENS = {'Chrome': ('chrome',), 'Edge': ('msedge', 'microsoft-edge'),
+                   'Brave': ('brave',), 'Chromium': ('chromium',)}
+
+def capture_chromium():
+    """Chrome/Edge/Brave/Chromium tabs on Windows and Linux. Skips browsers
+    with no running process. DevTools first for accuracy, session files
+    otherwise."""
+    if IS_WIN:
+        names = {p['name'].lower() for p in _win_proc_list()}
+    else:
+        names = {comm.rsplit('/', 1)[-1].lower() for _pp, comm in _proc_table().values()}
+    wins = []
+    for name, root in _chromium_roots():
+        toks = _BROWSER_TOKENS.get(name, ())
+        if not any(any(t in n for t in toks) for n in names):
+            continue
+        got = _devtools_windows(root)
+        if not got:
+            got = _snss_windows(root)
+        wins += got
+    return wins
+
 def _lz4_block_decompress(src):
     """Minimal LZ4 block decoder (pure Python). Enough for Firefox sessions."""
     out = bytearray()
@@ -613,7 +779,7 @@ def do_save(intent=None, project='', note=''):
         'note': note or '',
         'project': project or '',
         'front': capture_front(),
-        'chrome': capture_browser('Google Chrome'),
+        'chrome': capture_browser('Google Chrome') if IS_MAC else capture_chromium(),
         'safari': capture_browser('Safari'),
         'firefox': capture_firefox(),
         'terminals': capture_terminals(),
@@ -630,7 +796,7 @@ def do_save(intent=None, project='', note=''):
     print(f'   {intent}')
     print(f'   浏览器 {ntabs} 标签 · 终端 {nterm} 目录 · VS Code {len(state["vscode"])} 工作区 · AI 会话 {nag}')
     if not IS_MAC and ntabs == 0:
-        print('   (提示: 本平台的浏览器采集目前支持 Firefox)')
+        print('   (提示: 本平台通过会话文件采集 Chrome/Edge/Brave/Firefox 标签)')
     notify('Quicksave', intent[:40])
     return slug
 
@@ -640,8 +806,14 @@ def restore_browser(app, wins):
     """Reopen only the tabs that are gone. Returns (opened, skipped)."""
     if not wins:
         return 0, 0
+    if IS_MAC:
+        now_open = capture_browser(app)
+    elif app == 'Google Chrome':
+        now_open = capture_chromium()
+    else:
+        now_open = []
     current = set()
-    for w in capture_browser(app):
+    for w in now_open:
         for t in w:
             current.add(t.get('url'))
     opened = skipped = 0
