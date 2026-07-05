@@ -5,6 +5,7 @@ Usage:
   qs list                                          list save points
   qs load [index]                                  restore one
   qs ui                                            open the web panel
+  qs doctor                                        check macOS permissions
 All data stays local in ~/Library/Application Support/Quicksave (macOS)
 or ~/.quicksave (Linux/Windows). Nothing is uploaded.
 
@@ -332,21 +333,27 @@ def _host_of(pid, table):
     return 'terminal'
 
 def capture_agents():
-    """Running Claude Code / Codex sessions: tool, cwd, host app, resume id."""
+    """Running Claude Code / Codex sessions: tool, cwd, host app, resume id.
+    If the same (tool, cwd) runs in more than one host, prefer the VS Code
+    one — that is the richer restore target."""
     table = _proc_table()
-    found, seen = [], set()
+    by_key = {}
     for pid, tool in _agent_pids(table).items():
         cwd = _cwd_of(pid)
-        if not cwd or (tool, cwd) in seen:
+        if not cwd:
             continue
-        seen.add((tool, cwd))
-        a = {'tool': tool, 'cwd': cwd, 'host': _host_of(pid, table)}
+        key = (tool, cwd)
+        host = _host_of(pid, table)
+        prev = by_key.get(key)
+        if prev and (prev['host'] == 'vscode' or host != 'vscode'):
+            continue                       # keep existing unless we found a vscode upgrade
+        a = {'tool': tool, 'cwd': cwd, 'host': host}
         if tool == 'claude':
             sid = _claude_session_for(cwd)
             if sid:
                 a['session'] = sid
-        found.append(a)
-    return found
+        by_key[key] = a
+    return list(by_key.values())
 
 def _claude_session_for(cwd):
     base = os.path.expanduser('~/.claude/projects/')
@@ -484,26 +491,57 @@ def restore_vscode(folders):
 def _frontmost():
     return osa('tell application "System Events" to get name of first application process whose frontmost is true')
 
-def _resume_in_vscode(folder, cmd):
-    """macOS: open the workspace, wait until VS Code is frontmost, then spawn
-    a fresh integrated terminal (^⇧`) and paste the resume command.
-    Never types unless VS Code owns the keyboard."""
+def _ax_ok():
+    """True iff the app hosting this process has Accessibility permission.
+    Reading a process's window count via System Events requires it."""
     if not IS_MAC:
         return False
+    r = osa('tell application "System Events" to tell process "Finder" to return count of windows')
+    return r is not None and r.strip().lstrip('-').isdigit()
+
+def _own_top_app():
+    """Name of the top-level app that runs this process (the one that must
+    hold Accessibility permission), e.g. 'Terminal' or 'Code'."""
+    if not IS_MAC:
+        return 'your terminal'
+    table = _proc_table()
+    for _pid, comm in _ancestors(str(os.getppid()), table):
+        name = comm.rsplit('/', 1)[-1]
+        if 'Code Helper' in comm or name in ('Electron', 'Code', 'code'):
+            return 'Code'
+        if name in ('Terminal', 'iTerm2', 'iTerm', 'WarpTerminal', 'ghostty',
+                    'kitty', 'alacritty', 'Hyper'):
+            return name
+    return 'your terminal'
+
+def _resume_in_vscode(folder, cmd):
+    """Open the workspace and put the resume command into a fresh integrated
+    terminal. Returns:
+      'auto'   — typed and ran it (needs Accessibility permission)
+      'manual' — opened the workspace and copied the command to the clipboard;
+                 the user presses ^⇧` then Cmd+V to finish
+      'noshow' — VS Code would not come to the front"""
+    if not IS_MAC:
+        return 'noshow'
     code = _code_cli()
     if code:
         subprocess.run([code, folder], timeout=15)
     else:
         subprocess.run(['open', '-a', 'Visual Studio Code', folder])
-    for _ in range(14):
+    for _ in range(16):
         if _frontmost() == 'Code':
             break
         time.sleep(0.5)
     else:
-        return False
+        return 'noshow'
+    # stage the command on the clipboard either way
     old_clip = subprocess.run(['pbpaste'], capture_output=True, text=True).stdout
     subprocess.run(['pbcopy'], input=cmd, text=True)
+    if not _ax_ok():
+        return 'manual'                    # leave it on the clipboard for the user
     ok = osa('''tell application "System Events"
+  set frontmost of first process whose name is "Code" to true
+  delay 0.3
   if name of first application process whose frontmost is true is not "Code" then return "lost"
   tell process "Code"
     keystroke "`" using {control down, shift down}
@@ -516,7 +554,7 @@ def _resume_in_vscode(folder, cmd):
 end tell
 return "ok"''', timeout=30)
     subprocess.run(['pbcopy'], input=old_clip, text=True)
-    return ok == 'ok'
+    return 'auto' if ok == 'ok' else 'manual'
 
 def restore_agents(agents):
     """Resume AI sessions in the host they were captured in.
@@ -537,8 +575,13 @@ def restore_agents(agents):
         else:
             cmd = 'codex resume'
         used.add(cwd)
-        if a.get('host') == 'vscode' and _resume_in_vscode(cwd, cmd):
-            detail.append((name, 'vscode')); continue
+        if a.get('host') == 'vscode':
+            r = _resume_in_vscode(cwd, cmd)
+            if r == 'auto':
+                detail.append((name, 'vscode')); continue
+            if r == 'manual':
+                detail.append((name, 'vscode-paste')); continue
+            # 'noshow' — VS Code never fronted; fall through to a terminal
         ok = _spawn_terminal(cwd, cmd)
         if a.get('host') == 'vscode':
             detail.append((name, 'terminal-fallback' if ok else 'failed'))
@@ -577,8 +620,10 @@ def do_list():
     for i, (slug, st) in enumerate(saves, 1):
         print(f'{i:3d}. {label(slug, st)}')
 
-AGENT_WORDS_CN = {'vscode': '已在 VS Code 内置终端接上', 'terminal': '已在终端接上',
-                  'terminal-fallback': '进不去 VS Code(缺辅助功能权限),改在终端接上',
+AGENT_WORDS_CN = {'vscode': '已在 VS Code 内置终端自动接上',
+                  'vscode-paste': '已打开 VS Code 工作区,命令已在剪贴板,按 ⌃⇧` 开终端后 ⌘V 回车即可',
+                  'terminal': '已在终端接上',
+                  'terminal-fallback': 'VS Code 没能到前台,改在终端接上',
                   'already': '本来就开着,没动', 'gone': '项目目录已不存在,跳过',
                   'failed': '没能自动打开,请手动恢复'}
 
@@ -756,8 +801,9 @@ const $=s=>document.querySelector(s);
 const api=(url,opt)=>fetch(url,Object.assign({headers:{'X-QS-Token':TOKEN,'Content-Type':'application/json'}},opt||{}));
 const AGENT_TEXT={
   vscode:'resumed in the VS Code terminal',
+  'vscode-paste':'VS Code workspace opened; command copied — press ^⇧` then ⌘V to finish',
   terminal:'resumed in a terminal window',
-  'terminal-fallback':'VS Code input unavailable (accessibility permission) — resumed in a terminal',
+  'terminal-fallback':'VS Code did not come forward — resumed in a terminal',
   already:'already running, left untouched',
   gone:'project folder no longer exists, skipped',
   failed:'could not reopen automatically'
@@ -1047,8 +1093,37 @@ def main():
         do_load(idx)
     elif cmd == 'ui':
         run_ui(open_browser='--no-open' not in args)
+    elif cmd == 'doctor':
+        do_doctor()
     else:
         print(__doc__)
+
+def do_doctor():
+    print('Quicksave 自检\n')
+    if not IS_MAC:
+        print('  平台:', sys.platform, '(非 macOS,自动输入到 VS Code 仅 macOS 支持)')
+        return
+    app = _own_top_app()
+    print(f'  运行 qs 的宿主 app:  {app}')
+    autom = _frontmost() is not None
+    ax = _ax_ok()
+    print(f'  自动化 (Automation): {"✅ 已授权" if autom else "❌ 未授权"}')
+    print(f'  辅助功能 (Accessibility): {"✅ 已授权" if ax else "❌ 未授权"}')
+    print()
+    if ax:
+        print('  AI 会话可以全自动接回 VS Code 内置终端。')
+    else:
+        print(f'  要让 AI 会话自动输入到 VS Code,需要给「{app}」开辅助功能权限:')
+        print('  系统设置 → 隐私与安全性 → 辅助功能,把它打开。')
+        print('  在没开之前,读档会打开工作区并把命令拷到剪贴板,你在 VS Code')
+        print('  里按 ⌃⇧` 开终端、⌘V 回车即可,不会掉进普通终端。')
+        print()
+        try:
+            input('  按回车打开「辅助功能」设置面板(Ctrl+C 跳过)… ')
+            subprocess.run(['open',
+                'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'])
+        except (EOFError, KeyboardInterrupt):
+            print()
 
 if __name__ == '__main__':
     main()
